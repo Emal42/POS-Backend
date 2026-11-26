@@ -3,7 +3,9 @@ import logging
 import os
 import secrets
 import shutil
+import re
 
+from app.auth import get_current_customer
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -80,7 +82,6 @@ app.add_exception_handler(
 # --------------------------------------------------
 
 class Ticket(BaseModel):
-    customer_id: str = Field(min_length=1)
     title: str = Field(min_length=3, max_length=100)
     category: str = Field(min_length=1)
     description: str = Field(min_length=10, max_length=2000)
@@ -88,14 +89,11 @@ class Ticket(BaseModel):
 
 
 class Message(BaseModel):
-    sender_id: str
-    sender_type: Literal["customer", "staff"]
-    message: str
+    message: str = Field(min_length=1, max_length=2000)
 
 
 class Feedback(BaseModel):
-    customer_id: str
-    comment: str = ""
+    comment: str = Field(min_length=1, max_length=2000)
 
 
 # --------------------------------------------------
@@ -111,14 +109,21 @@ def home():
 
 @app.get("/test-database")
 def test_database():
-    if check_database():
-        return {
-            "message": "MongoDB connection successful!"
-        }
+    if os.getenv("AUTH_MODE") == "development":
+        if check_database():
+            return {
+                "message": "MongoDB connection successful!"
+            }
 
-    return {
-        "message": "MongoDB connection failed"
-    }
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB connection failed"
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail="Not found"
+    )
 
 
 # --------------------------------------------------
@@ -129,9 +134,15 @@ def test_database():
 @limiter.limit("5/minute")
 async def create_new_ticket(
     request: Request,
-    ticket: Ticket
+    ticket: Ticket,
+    current_customer: dict = Depends(get_current_customer)
 ):
-    new_ticket = create_ticket(ticket.model_dump())
+    ticket_data = ticket.model_dump()
+
+    # Get customer ID from authentication
+    ticket_data["customer_id"] = current_customer["user_id"]
+
+    new_ticket = create_ticket(ticket_data)
 
     discord_notification = "pending"
 
@@ -167,34 +178,36 @@ async def create_new_ticket(
 @app.get("/tickets")
 def get_tickets(
     status: str = None,
-    customer_id: str = None,
     source: str = None,
     search: str = None,
     date_from: str = None,
-    date_to: str = None
+    date_to: str = None,
+    current_customer: dict = Depends(get_current_customer)
 ):
-    query = {}
+    # Customers can only retrieve their own tickets
+    query = {
+        "customer_id": current_customer["user_id"]
+    }
 
     if status:
         query["status"] = status
-
-    if customer_id:
-        query["customer_id"] = customer_id
 
     if source:
         query["source"] = source
 
     if search:
+        safe_search = re.escape(search)
+
         query["$or"] = [
             {
                 "ticket_id": {
-                    "$regex": search,
+                    "$regex": safe_search,
                     "$options": "i"
                 }
             },
             {
                 "title": {
-                    "$regex": search,
+                    "$regex": safe_search,
                     "$options": "i"
                 }
             }
@@ -242,22 +255,27 @@ def get_tickets(
 # --------------------------------------------------
 
 @app.get("/tickets/summary")
-def get_ticket_summary():
+def get_ticket_summary(
+    current_customer: dict = Depends(get_current_customer)
+):
+    customer_id = current_customer["user_id"]
 
     resolved = database.tickets.count_documents({
+        "customer_id": customer_id,
         "status": "Resolved"
     })
 
     awaiting_reply = database.tickets.count_documents({
+        "customer_id": customer_id,
         "status": "Awaiting Reply"
     })
 
     active = database.tickets.count_documents({
+        "customer_id": customer_id,
         "status": {
             "$in": [
                 "Open",
-                "In Progress",
-                "Awaiting Reply"
+                "In Progress"
             ]
         }
     })
@@ -274,10 +292,15 @@ def get_ticket_summary():
 # --------------------------------------------------
 
 @app.get("/tickets/{ticket_id}")
-def get_ticket_details(ticket_id: str):
-
+def get_ticket_details(
+    ticket_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
     ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id},
+        {
+            "ticket_id": ticket_id,
+            "customer_id": current_customer["user_id"]
+        },
         {"_id": 0}
     )
 
@@ -291,49 +314,6 @@ def get_ticket_details(ticket_id: str):
 
 
 # --------------------------------------------------
-# Update ticket status
-# --------------------------------------------------
-
-@app.patch("/tickets/{ticket_id}/status")
-def change_ticket_status(
-    ticket_id: str,
-    status: str
-):
-    allowed_statuses = [
-        "Open",
-        "In Progress",
-        "Awaiting Reply",
-        "Resolved"
-    ]
-
-    if status not in allowed_statuses:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid ticket status"
-        )
-
-    result = database.tickets.update_one(
-        {"ticket_id": ticket_id},
-        {
-            "$set": {
-                "status": status
-            }
-        }
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Ticket not found"
-        )
-
-    return {
-        "message": "Ticket status updated successfully",
-        "status": status
-    }
-
-
-# --------------------------------------------------
 # Create a ticket message
 # --------------------------------------------------
 
@@ -342,12 +322,13 @@ def change_ticket_status(
 async def create_message(
     request: Request,
     ticket_id: str,
-    message: Message
+    message: Message,
+    current_customer: dict = Depends(get_current_customer)
 ):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -358,8 +339,8 @@ async def create_message(
     new_message = {
         "message_id": str(uuid4()),
         "ticket_id": ticket_id,
-        "sender_id": message.sender_id,
-        "sender_type": message.sender_type,
+        "sender_id": current_customer["user_id"],
+        "sender_type": "customer",
         "message": message.message,
         "created_at": datetime.now(timezone.utc),
         "is_read": False
@@ -367,30 +348,25 @@ async def create_message(
 
     database.messages.insert_one(new_message)
 
-    discord_notification = "not_required"
+    discord_notification = "failed"
 
-    # Only customer messages need to be sent to Discord.
-    if message.sender_type == "customer":
+    try:
+        bot = get_bot()
 
-        try:
-            bot = get_bot()
+        if bot is None or not bot.is_ready():
+            raise RuntimeError("Discord bot is not ready")
 
-            if bot is None or not bot.is_ready():
-                raise RuntimeError("Discord bot is not ready")
+        await bot.post_client_message(
+            ticket_id,
+            new_message
+        )
 
-            await bot.post_client_message(
-                ticket_id,
-                new_message
-            )
+        discord_notification = "sent"
 
-            discord_notification = "sent"
-
-        except Exception:
-            logger.exception(
-                "Customer message saved, but Discord notification failed"
-            )
-
-            discord_notification = "failed"
+    except Exception:
+        logger.exception(
+            "Customer message saved, but Discord notification failed"
+        )
 
     return {
         "message": "Message sent successfully",
@@ -404,11 +380,14 @@ async def create_message(
 # --------------------------------------------------
 
 @app.get("/tickets/{ticket_id}/messages")
-def get_ticket_messages(ticket_id: str):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+def get_ticket_messages(
+    ticket_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -438,12 +417,13 @@ def get_ticket_messages(ticket_id: str):
 def upload_attachment(
     request: Request,
     ticket_id: str,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_customer: dict = Depends(get_current_customer)
 ):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -489,9 +469,7 @@ def upload_attachment(
         )
 
     attachment_id = str(uuid4())
-
     filename = attachment_id + extension
-
     file_path = UPLOAD_FOLDER / filename
 
     file_path.write_bytes(content)
@@ -517,11 +495,14 @@ def upload_attachment(
 # --------------------------------------------------
 
 @app.get("/tickets/{ticket_id}/attachments")
-def get_ticket_attachments(ticket_id: str):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+def get_ticket_attachments(
+    ticket_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -547,13 +528,26 @@ def get_ticket_attachments(ticket_id: str):
 # --------------------------------------------------
 
 @app.get("/attachments/{attachment_id}/download")
-def download_attachment(attachment_id: str):
-
+def download_attachment(
+    attachment_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
     attachment = database.attachments.find_one(
         {"attachment_id": attachment_id}
     )
 
     if attachment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Attachment not found"
+        )
+
+    ticket = database.tickets.find_one({
+        "ticket_id": attachment["ticket_id"],
+        "customer_id": current_customer["user_id"]
+    })
+
+    if ticket is None:
         raise HTTPException(
             status_code=404,
             detail="Attachment not found"
@@ -578,11 +572,14 @@ def download_attachment(attachment_id: str):
 # --------------------------------------------------
 
 @app.patch("/tickets/{ticket_id}/close")
-def close_ticket(ticket_id: str):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+def close_ticket(
+    ticket_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -597,7 +594,10 @@ def close_ticket(ticket_id: str):
         )
 
     database.tickets.update_one(
-        {"ticket_id": ticket_id},
+        {
+            "ticket_id": ticket_id,
+            "customer_id": current_customer["user_id"]
+        },
         {
             "$set": {
                 "status": "Resolved",
@@ -618,11 +618,14 @@ def close_ticket(ticket_id: str):
 # --------------------------------------------------
 
 @app.patch("/tickets/{ticket_id}/reopen")
-def reopen_ticket(ticket_id: str):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+def reopen_ticket(
+    ticket_id: str,
+    current_customer: dict = Depends(get_current_customer)
+):
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -655,7 +658,10 @@ def reopen_ticket(ticket_id: str):
         )
 
     database.tickets.update_one(
-        {"ticket_id": ticket_id},
+        {
+            "ticket_id": ticket_id,
+            "customer_id": current_customer["user_id"]
+        },
         {
             "$set": {
                 "status": "Open"
@@ -679,12 +685,13 @@ def reopen_ticket(ticket_id: str):
 @app.post("/tickets/{ticket_id}/feedback")
 def submit_feedback(
     ticket_id: str,
-    feedback: Feedback
+    feedback: Feedback,
+    current_customer: dict = Depends(get_current_customer)
 ):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(
@@ -701,7 +708,7 @@ def submit_feedback(
     new_feedback = {
         "feedback_id": str(uuid4()),
         "ticket_id": ticket_id,
-        "customer_id": feedback.customer_id,
+        "customer_id": current_customer["user_id"],
         "comment": feedback.comment,
         "created_at": datetime.now(timezone.utc)
     }
@@ -720,18 +727,12 @@ def submit_feedback(
 @app.patch("/tickets/{ticket_id}/messages/read")
 def mark_messages_as_read(
     ticket_id: str,
-    reader_type: str = "customer"
+    current_customer: dict = Depends(get_current_customer)
 ):
-
-    if reader_type != "customer":
-        raise HTTPException(
-            status_code=400,
-            detail="Only customer read tracking is supported"
-        )
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
+    ticket = database.tickets.find_one({
+        "ticket_id": ticket_id,
+        "customer_id": current_customer["user_id"]
+    })
 
     if ticket is None:
         raise HTTPException(

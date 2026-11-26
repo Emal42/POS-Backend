@@ -24,6 +24,10 @@ async def start_bot():
     )
 
     try:
+        # Allow the Discord client to begin initialising.
+        await asyncio.sleep(0)
+
+        # Wait until Discord has connected.
         await asyncio.wait_for(
             bot.wait_until_ready(),
             timeout=30
@@ -40,7 +44,7 @@ async def start_bot():
         if bot_task is not None:
             try:
                 await bot_task
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 pass
 
         bot = None
@@ -61,7 +65,9 @@ async def stop_bot():
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Error while stopping Discord bot.")
+            logger.exception(
+                "Error while stopping Discord bot."
+            )
 
     bot = None
     bot_task = None

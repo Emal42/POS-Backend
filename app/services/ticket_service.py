@@ -5,6 +5,14 @@ from uuid import uuid4
 from app.database import database
 
 
+ALLOWED_STATUSES = [
+    "Open",
+    "In Progress",
+    "Awaiting Reply",
+    "Resolved"
+]
+
+
 def create_ticket(ticket_data):
     new_ticket = {
         "ticket_id": str(uuid4()),
@@ -30,22 +38,33 @@ def get_ticket(ticket_id):
 
 
 def update_ticket_status(ticket_id, status):
-    allowed_statuses = [
-        "Open",
-        "In Progress",
-        "Awaiting Reply",
-        "Resolved"
-    ]
-
-    if status not in allowed_statuses:
+    if status not in ALLOWED_STATUSES:
         raise ValueError("Invalid ticket status")
+
+    update = {
+        "$set": {
+            "status": status
+        }
+    }
+
+    if status == "Resolved":
+        update["$set"]["resolved_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
+    else:
+        update["$unset"] = {
+            "resolved_at": ""
+        }
 
     result = database.tickets.update_one(
         {"ticket_id": ticket_id},
-        {"$set": {"status": status}}
+        update
     )
 
-    return result.matched_count > 0
+    if result.matched_count == 0:
+        raise ValueError("Ticket not found")
+
+    return True
 
 
 def create_ticket_message(
@@ -56,6 +75,9 @@ def create_ticket_message(
     staff_name=None,
     attachments=None
 ):
+    if sender_type not in ["customer", "staff"]:
+        raise ValueError("Invalid sender type")
+
     ticket = get_ticket(ticket_id)
 
     if not ticket:
@@ -66,7 +88,7 @@ def create_ticket_message(
         "ticket_id": ticket_id,
         "sender_id": str(sender_id),
         "sender_type": sender_type,
-        "message": message,
+        "message": str(message or "").strip(),
         "created_at": datetime.now(timezone.utc),
         "is_read": False,
         "staff_name": staff_name,
@@ -78,7 +100,12 @@ def create_ticket_message(
     return new_message
 
 
-def save_discord_thread(ticket_id, guild_id, channel_id, thread_id):
+def save_discord_thread(
+    ticket_id,
+    guild_id,
+    channel_id,
+    thread_id
+):
     database.discord_threads.update_one(
         {"ticket_id": ticket_id},
         {
@@ -91,3 +118,5 @@ def save_discord_thread(ticket_id, guild_id, channel_id, thread_id):
         },
         upsert=True
     )
+
+    return True
