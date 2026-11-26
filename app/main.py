@@ -1,70 +1,47 @@
-from fastapi import FastAPI
-from app.database import check_database, database
-from pydantic import BaseModel
-from datetime import datetime, timezone, timedelta
-from uuid import uuid4
-from fastapi import HTTPException
+
+import logging
 import os
 import secrets
-from dotenv import load_dotenv
-from fastapi import Depends, Header
-from fastapi import UploadFile, File
-from pathlib import Path
 import shutil
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from uuid import uuid4
+
+from dotenv import load_dotenv
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+    Header,
+    UploadFile,
+    File,
+    Request
+)
 from fastapi.responses import FileResponse
-from fastapi import Request
+from pydantic import BaseModel, Field
+from typing import Literal
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from pydantic import Field
-from typing import Literal
+from app.database import check_database, database
+from app.services.ticket_service import create_ticket
+from app.bot.manager import start_bot, stop_bot, get_bot
 
-limiter = Limiter(key_func=get_remote_address)
 
-app = FastAPI()
-
-app.state.limiter = limiter
-app.add_exception_handler(
-    RateLimitExceeded,
-    _rate_limit_exceeded_handler
-)
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
 load_dotenv()
 
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("posperity.api")
 
-
-def verify_discord_bot(x_bot_token: str = Header(default="")):
-
-    if not DISCORD_BOT_TOKEN or not secrets.compare_digest(
-        x_bot_token, DISCORD_BOT_TOKEN
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Discord bot token"
-        )
-
-class Ticket(BaseModel):
-    customer_id: str = Field(min_length=1)
-    title: str = Field(min_length=3, max_length=100)
-    category: str = Field(min_length=1)
-    description: str = Field(min_length=10, max_length=2000)
-    source: Literal["main_pos", "sales_website"]
-class Message(BaseModel):
-    sender_id: str
-    sender_type: str
-    message: str
-class DiscordThread(BaseModel):
-    guild_id: str
-    channel_id: str
-    thread_id: str
-class StaffReply(BaseModel):
-    staff_id: str
-    message: str
-class Feedback(BaseModel):
-    customer_id: str
-    comment: str = ""
+limiter = Limiter(key_func=get_remote_address)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
@@ -73,40 +50,119 @@ ALLOWED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf"]
 UPLOAD_FOLDER = Path("uploads")
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
+
+# --------------------------------------------------
+# FastAPI and Discord bot lifecycle
+# --------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await start_bot()
+
+    try:
+        yield
+    finally:
+        await stop_bot()
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.state.limiter = limiter
+
+app.add_exception_handler(
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler
+)
+
+
+# --------------------------------------------------
+# Request models
+# --------------------------------------------------
+
+class Ticket(BaseModel):
+    customer_id: str = Field(min_length=1)
+    title: str = Field(min_length=3, max_length=100)
+    category: str = Field(min_length=1)
+    description: str = Field(min_length=10, max_length=2000)
+    source: Literal["main_pos", "sales_website"]
+
+
+class Message(BaseModel):
+    sender_id: str
+    sender_type: Literal["customer", "staff"]
+    message: str
+
+
+class Feedback(BaseModel):
+    customer_id: str
+    comment: str = ""
+
+
+# --------------------------------------------------
+# General endpoints
+# --------------------------------------------------
+
 @app.get("/")
 def home():
-    return {"message": "POSperity Support API is running"}
+    return {
+        "message": "POSperity Support API is running"
+    }
+
 
 @app.get("/test-database")
 def test_database():
     if check_database():
-        return {"message": "MongoDB connection successful!"}
+        return {
+            "message": "MongoDB connection successful!"
+        }
 
-    return {"message": "MongoDB connection failed"}
+    return {
+        "message": "MongoDB connection failed"
+    }
+
+
+# --------------------------------------------------
+# Ticket creation
+# --------------------------------------------------
 
 @app.post("/tickets")
 @limiter.limit("5/minute")
-def create_ticket(request: Request, ticket: Ticket):
+async def create_new_ticket(
+    request: Request,
+    ticket: Ticket
+):
+    new_ticket = create_ticket(ticket.model_dump())
 
-    new_ticket = {
-        "ticket_id": str(uuid4()),
-        "customer_id": ticket.customer_id,
-        "title": ticket.title,
-        "category": ticket.category,
-        "description": ticket.description,
-        "source": ticket.source,
-        "status": "Open",
-        "created_at": datetime.now(timezone.utc)
-    }
+    discord_notification = "pending"
 
-    database.tickets.insert_one(new_ticket)
+    try:
+        bot = get_bot()
+
+        if bot is None or not bot.is_ready():
+            raise RuntimeError("Discord bot is not ready")
+
+        await bot.create_ticket_thread(new_ticket)
+
+        discord_notification = "sent"
+
+    except Exception:
+        logger.exception(
+            "Ticket created, but Discord notification failed: %s",
+            new_ticket["ticket_id"]
+        )
+
+        discord_notification = "failed"
 
     return {
         "message": "Ticket created successfully",
-        "ticket_id": new_ticket["ticket_id"]
+        "ticket_id": new_ticket["ticket_id"],
+        "discord_notification": discord_notification
     }
 
 
+# --------------------------------------------------
+# Get and filter tickets
+# --------------------------------------------------
 
 @app.get("/tickets")
 def get_tickets(
@@ -130,8 +186,18 @@ def get_tickets(
 
     if search:
         query["$or"] = [
-            {"ticket_id": {"$regex": search, "$options": "i"}},
-            {"title": {"$regex": search, "$options": "i"}}
+            {
+                "ticket_id": {
+                    "$regex": search,
+                    "$options": "i"
+                }
+            },
+            {
+                "title": {
+                    "$regex": search,
+                    "$options": "i"
+                }
+            }
         ]
 
     if date_from or date_to:
@@ -140,12 +206,14 @@ def get_tickets(
         try:
             if date_from:
                 date_filter["$gte"] = datetime.strptime(
-                    date_from, "%Y-%m-%d"
+                    date_from,
+                    "%Y-%m-%d"
                 )
 
             if date_to:
                 date_filter["$lt"] = datetime.strptime(
-                    date_to, "%Y-%m-%d"
+                    date_to,
+                    "%Y-%m-%d"
                 ) + timedelta(days=1)
 
         except ValueError:
@@ -156,7 +224,12 @@ def get_tickets(
 
         query["created_at"] = date_filter
 
-    tickets = list(database.tickets.find(query, {"_id": 0}))
+    tickets = list(
+        database.tickets.find(
+            query,
+            {"_id": 0}
+        ).sort("created_at", -1)
+    )
 
     return {
         "total": len(tickets),
@@ -164,7 +237,9 @@ def get_tickets(
     }
 
 
-
+# --------------------------------------------------
+# Ticket summary
+# --------------------------------------------------
 
 @app.get("/tickets/summary")
 def get_ticket_summary():
@@ -179,7 +254,11 @@ def get_ticket_summary():
 
     active = database.tickets.count_documents({
         "status": {
-            "$in": ["Open", "In Progress", "Awaiting Reply"]
+            "$in": [
+                "Open",
+                "In Progress",
+                "Awaiting Reply"
+            ]
         }
     })
 
@@ -190,22 +269,36 @@ def get_ticket_summary():
     }
 
 
+# --------------------------------------------------
+# Get one ticket
+# --------------------------------------------------
+
 @app.get("/tickets/{ticket_id}")
-def get_ticket(ticket_id: str):
+def get_ticket_details(ticket_id: str):
+
     ticket = database.tickets.find_one(
         {"ticket_id": ticket_id},
         {"_id": 0}
     )
 
     if ticket is None:
-        return {"message": "Ticket not found"}
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found"
+        )
 
     return ticket
 
 
-@app.patch("/tickets/{ticket_id}/status")
-def update_ticket_status(ticket_id: str, status: str):
+# --------------------------------------------------
+# Update ticket status
+# --------------------------------------------------
 
+@app.patch("/tickets/{ticket_id}/status")
+def change_ticket_status(
+    ticket_id: str,
+    status: str
+):
     allowed_statuses = [
         "Open",
         "In Progress",
@@ -221,7 +314,11 @@ def update_ticket_status(ticket_id: str, status: str):
 
     result = database.tickets.update_one(
         {"ticket_id": ticket_id},
-        {"$set": {"status": status}}
+        {
+            "$set": {
+                "status": status
+            }
+        }
     )
 
     if result.matched_count == 0:
@@ -235,9 +332,18 @@ def update_ticket_status(ticket_id: str, status: str):
         "status": status
     }
 
+
+# --------------------------------------------------
+# Create a ticket message
+# --------------------------------------------------
+
 @app.post("/tickets/{ticket_id}/messages")
 @limiter.limit("10/minute")
-def create_message(request: Request, ticket_id: str, message: Message):
+async def create_message(
+    request: Request,
+    ticket_id: str,
+    message: Message
+):
 
     ticket = database.tickets.find_one(
         {"ticket_id": ticket_id}
@@ -261,10 +367,41 @@ def create_message(request: Request, ticket_id: str, message: Message):
 
     database.messages.insert_one(new_message)
 
+    discord_notification = "not_required"
+
+    # Only customer messages need to be sent to Discord.
+    if message.sender_type == "customer":
+
+        try:
+            bot = get_bot()
+
+            if bot is None or not bot.is_ready():
+                raise RuntimeError("Discord bot is not ready")
+
+            await bot.post_client_message(
+                ticket_id,
+                new_message
+            )
+
+            discord_notification = "sent"
+
+        except Exception:
+            logger.exception(
+                "Customer message saved, but Discord notification failed"
+            )
+
+            discord_notification = "failed"
+
     return {
         "message": "Message sent successfully",
-        "message_id": new_message["message_id"]
+        "message_id": new_message["message_id"],
+        "discord_notification": discord_notification
     }
+
+
+# --------------------------------------------------
+# Get ticket messages
+# --------------------------------------------------
 
 @app.get("/tickets/{ticket_id}/messages")
 def get_ticket_messages(ticket_id: str):
@@ -292,98 +429,17 @@ def get_ticket_messages(ticket_id: str):
     }
 
 
-@app.post(
-    "/tickets/{ticket_id}/discord-thread",
-    dependencies=[Depends(verify_discord_bot)]
-)
-def connect_discord_thread(
-    ticket_id: str,
-    discord: DiscordThread
-):
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
-
-    if ticket is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Ticket not found"
-        )
-
-    database.discord_threads.update_one(
-        {"ticket_id": ticket_id},
-        {
-            "$set": {
-                "ticket_id": ticket_id,
-                "guild_id": discord.guild_id,
-                "channel_id": discord.channel_id,
-                "thread_id": discord.thread_id,
-                "created_at": datetime.now(timezone.utc)
-            }
-        },
-        upsert=True
-    )
-
-    return {
-        "message": "Discord thread connected successfully"
-    }
-
-
-@app.post(
-    "/tickets/{ticket_id}/staff-reply",
-    dependencies=[Depends(verify_discord_bot)]
-)
-def staff_reply(ticket_id: str, reply: StaffReply):
-
-    ticket = database.tickets.find_one(
-        {"ticket_id": ticket_id}
-    )
-
-    if ticket is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Ticket not found"
-        )
-
-    new_message = {
-        "message_id": str(uuid4()),
-        "ticket_id": ticket_id,
-        "sender_id": reply.staff_id,
-        "sender_type": "staff",
-        "message": reply.message,
-        "created_at": datetime.now(timezone.utc)
-    }
-
-    database.messages.insert_one(new_message)
-
-    return {
-        "message": "Staff reply saved successfully"
-    }
-
-
-@app.get(
-    "/discord-threads/{thread_id}",
-    dependencies=[Depends(verify_discord_bot)]
-)
-def get_ticket_from_discord(thread_id: str):
-
-    discord_thread = database.discord_threads.find_one(
-        {"thread_id": thread_id},
-        {"_id": 0}
-    )
-
-    if discord_thread is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Discord thread not found"
-        )
-
-    return discord_thread
-
+# --------------------------------------------------
+# Upload ticket attachment
+# --------------------------------------------------
 
 @app.post("/tickets/{ticket_id}/attachments")
 @limiter.limit("5/minute")
-def upload_attachment(request: Request, ticket_id: str, file: UploadFile = File(...)):
+def upload_attachment(
+    request: Request,
+    ticket_id: str,
+    file: UploadFile = File(...)
+):
 
     ticket = database.tickets.find_one(
         {"ticket_id": ticket_id}
@@ -412,9 +468,18 @@ def upload_attachment(request: Request, ticket_id: str, file: UploadFile = File(
         )
 
     valid_file = (
-        (extension == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n")) or
-        (extension in [".jpg", ".jpeg"] and content.startswith(b"\xff\xd8\xff")) or
-        (extension == ".pdf" and content.startswith(b"%PDF-"))
+        (
+            extension == ".png"
+            and content.startswith(b"\x89PNG\r\n\x1a\n")
+        )
+        or (
+            extension in [".jpg", ".jpeg"]
+            and content.startswith(b"\xff\xd8\xff")
+        )
+        or (
+            extension == ".pdf"
+            and content.startswith(b"%PDF-")
+        )
     )
 
     if not valid_file:
@@ -424,7 +489,9 @@ def upload_attachment(request: Request, ticket_id: str, file: UploadFile = File(
         )
 
     attachment_id = str(uuid4())
+
     filename = attachment_id + extension
+
     file_path = UPLOAD_FOLDER / filename
 
     file_path.write_bytes(content)
@@ -443,6 +510,11 @@ def upload_attachment(request: Request, ticket_id: str, file: UploadFile = File(
         "message": "Attachment uploaded successfully",
         "attachment_id": attachment_id
     }
+
+
+# --------------------------------------------------
+# Get ticket attachments
+# --------------------------------------------------
 
 @app.get("/tickets/{ticket_id}/attachments")
 def get_ticket_attachments(ticket_id: str):
@@ -470,6 +542,10 @@ def get_ticket_attachments(ticket_id: str):
     }
 
 
+# --------------------------------------------------
+# Download attachment
+# --------------------------------------------------
+
 @app.get("/attachments/{attachment_id}/download")
 def download_attachment(attachment_id: str):
 
@@ -496,6 +572,11 @@ def download_attachment(attachment_id: str):
         filename=attachment["original_filename"]
     )
 
+
+# --------------------------------------------------
+# Close ticket
+# --------------------------------------------------
+
 @app.patch("/tickets/{ticket_id}/close")
 def close_ticket(ticket_id: str):
 
@@ -520,7 +601,9 @@ def close_ticket(ticket_id: str):
         {
             "$set": {
                 "status": "Resolved",
-                "resolved_at": datetime.now(timezone.utc).isoformat()
+                "resolved_at": datetime.now(
+                    timezone.utc
+                ).isoformat()
             }
         }
     )
@@ -529,6 +612,10 @@ def close_ticket(ticket_id: str):
         "message": "Ticket resolved successfully"
     }
 
+
+# --------------------------------------------------
+# Reopen ticket
+# --------------------------------------------------
 
 @app.patch("/tickets/{ticket_id}/reopen")
 def reopen_ticket(ticket_id: str):
@@ -549,9 +636,19 @@ def reopen_ticket(ticket_id: str):
             detail="Only resolved tickets can be reopened"
         )
 
-    resolved_at = datetime.fromisoformat(ticket["resolved_at"])
+    resolved_at = datetime.fromisoformat(
+        ticket["resolved_at"]
+    )
 
-    if datetime.now(timezone.utc) - resolved_at > timedelta(days=7):
+    if resolved_at.tzinfo is None:
+        resolved_at = resolved_at.replace(
+            tzinfo=timezone.utc
+        )
+
+    if (
+        datetime.now(timezone.utc) - resolved_at
+        > timedelta(days=7)
+    ):
         raise HTTPException(
             status_code=400,
             detail="Tickets can only be reopened within 7 days"
@@ -560,8 +657,12 @@ def reopen_ticket(ticket_id: str):
     database.tickets.update_one(
         {"ticket_id": ticket_id},
         {
-            "$set": {"status": "Open"},
-            "$unset": {"resolved_at": ""}
+            "$set": {
+                "status": "Open"
+            },
+            "$unset": {
+                "resolved_at": ""
+            }
         }
     )
 
@@ -570,8 +671,16 @@ def reopen_ticket(ticket_id: str):
         "status": "Open"
     }
 
+
+# --------------------------------------------------
+# Submit feedback
+# --------------------------------------------------
+
 @app.post("/tickets/{ticket_id}/feedback")
-def submit_feedback(ticket_id: str, feedback: Feedback):
+def submit_feedback(
+    ticket_id: str,
+    feedback: Feedback
+):
 
     ticket = database.tickets.find_one(
         {"ticket_id": ticket_id}
@@ -603,20 +712,37 @@ def submit_feedback(ticket_id: str, feedback: Feedback):
         "message": "Feedback submitted successfully"
     }
 
+
+# --------------------------------------------------
+# Customer read tracking
+# --------------------------------------------------
+
 @app.patch("/tickets/{ticket_id}/messages/read")
-def mark_messages_as_read(ticket_id: str, reader_type: str):
-    if reader_type not in ["customer", "staff"]:
+def mark_messages_as_read(
+    ticket_id: str,
+    reader_type: str = "customer"
+):
+
+    if reader_type != "customer":
         raise HTTPException(
             status_code=400,
-            detail="Invalid reader type"
+            detail="Only customer read tracking is supported"
+        )
+
+    ticket = database.tickets.find_one(
+        {"ticket_id": ticket_id}
+    )
+
+    if ticket is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found"
         )
 
     result = database.messages.update_many(
         {
             "ticket_id": ticket_id,
-            "sender_type": {
-                "$ne": reader_type
-            },
+            "sender_type": "staff",
             "is_read": False
         },
         {
