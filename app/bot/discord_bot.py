@@ -327,7 +327,10 @@ class SupportBot(discord.Client):
                     for attachment in message.attachments
                 ]
             )
-
+            update_ticket_status(
+                ticket_id,
+                "Awaiting Reply"
+                )
             await message.add_reaction("✅")
 
         except Exception:
@@ -418,6 +421,10 @@ class MessageModal(discord.ui.Modal):
                     "staff",
                     text,
                     staff_name=initials
+                )
+                update_ticket_status(
+                    ticket_id,
+                    "Awaiting Reply"
                 )
 
                 await interaction.followup.send(

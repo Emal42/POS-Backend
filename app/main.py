@@ -32,7 +32,7 @@ from slowapi.errors import RateLimitExceeded
 from app.database import check_database, database
 from app.services.ticket_service import create_ticket
 from app.bot.manager import start_bot, stop_bot, get_bot
-
+from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------
 # Configuration
@@ -68,6 +68,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174"
+    ],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):[0-9]+$",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 app.state.limiter = limiter
 
@@ -167,6 +181,7 @@ async def create_new_ticket(
     return {
         "message": "Ticket created successfully",
         "ticket_id": new_ticket["ticket_id"],
+        "ticket_number": new_ticket["ticket_number"],
         "discord_notification": discord_notification
     }
 
