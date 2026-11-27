@@ -2,7 +2,7 @@
 import logging
 
 import discord
-
+from app.database import database
 from app.services.ticket_service import (
     get_ticket,
     create_ticket_message,
@@ -63,7 +63,18 @@ class SupportBot(discord.Client):
             or await self.fetch_channel(channel_id)
         )
 
+    
     async def find_thread(self, ticket_id):
+        ticket = get_ticket(ticket_id)
+
+        if not ticket:
+            raise LookupError(f"Ticket {ticket_id} not found")
+
+        ticket_number = ticket.get("ticket_number")
+
+        if ticket_number is None:
+            raise LookupError("Ticket has no ticket number")
+
         channel = await self.channel_by_id(
             self.config.tickets_channel_id
         )
@@ -71,18 +82,19 @@ class SupportBot(discord.Client):
         for thread in await channel.guild.active_threads():
             if (
                 thread.parent_id == channel.id
-                and h.ticket_number_from_name(thread.name) == ticket_id
+                and h.ticket_number_from_name(thread.name) == ticket_number
             ):
                 return thread
 
         async for thread in channel.archived_threads(limit=100):
-            if h.ticket_number_from_name(thread.name) == ticket_id:
+            if h.ticket_number_from_name(thread.name) == ticket_number:
                 await thread.edit(archived=False)
                 return thread
 
         raise LookupError(
-            f"No Discord thread for ticket {ticket_id}"
+            f"No Discord thread for ticket #{ticket_number}"
         )
+
 
     def ticket_of(self, channel):
         if (
@@ -90,7 +102,17 @@ class SupportBot(discord.Client):
             and channel.type == discord.ChannelType.public_thread
             and channel.parent_id == self.config.tickets_channel_id
         ):
-            return h.ticket_number_from_name(channel.name)
+            number = h.ticket_number_from_name(channel.name)
+
+            if number is None:
+                return None
+
+            ticket = database.tickets.find_one(
+                {"ticket_number": number},
+                {"ticket_id": 1, "_id": 0}
+            )
+
+            return ticket["ticket_id"] if ticket else None
 
         return None
 

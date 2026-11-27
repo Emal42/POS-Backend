@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.database import database
-
+from pymongo import ReturnDocument
 
 ALLOWED_STATUSES = [
     "Open",
@@ -13,9 +13,23 @@ ALLOWED_STATUSES = [
 ]
 
 
+
+
+
+
 def create_ticket(ticket_data):
+    counter = database.counters.find_one_and_update(
+        {"_id": "ticket_number"},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+
+    ticket_number = counter["sequence_value"]
+
     new_ticket = {
         "ticket_id": str(uuid4()),
+        "ticket_number": ticket_number,
         "customer_id": ticket_data["customer_id"],
         "title": ticket_data["title"],
         "category": ticket_data["category"],
@@ -28,6 +42,7 @@ def create_ticket(ticket_data):
     database.tickets.insert_one(new_ticket)
 
     return new_ticket
+
 
 
 def get_ticket(ticket_id):

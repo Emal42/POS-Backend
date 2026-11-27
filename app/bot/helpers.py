@@ -6,17 +6,18 @@ from datetime import datetime, timezone
 
 
 def thread_name(ticket):
-    """Creates a Discord thread name using the ticket UUID."""
-    return f"[{ticket['ticket_id']}] {ticket['title']}"[:100]
+    """Creates a Discord thread name using the ticket number."""
+    number = ticket.get("ticket_number", "Unknown")
+    return f"[#{number}] {ticket['title']}"[:100]
 
 
 def ticket_number_from_name(name):
-    """Extracts the UUID from a Discord thread name."""
+    """Extracts the ticket number from a Discord thread name."""
     match = re.match(
-        r"^\[([a-fA-F0-9-]{36})\]",
+        r"^\[#(\d+)\]",
         name or ""
     )
-    return match.group(1) if match else None
+    return int(match.group(1)) if match else None
 
 
 def initials_of(display_name):
